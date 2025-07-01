@@ -80,17 +80,68 @@ const FirebaseService = {
       throw error;
     }
   },
+  
+  // Add a new table to the database
+  addTable: async (tableData) => {
+    try {
+      // Create table in database
+      const docRef = await addDoc(collection(db, "tables"), {
+        ...tableData,
+        occupiedSince: null,
+        status: "Available",
+        createdAt: serverTimestamp()
+      });
+      
+      // Return complete table object
+      return { 
+        id: docRef.id, 
+        ...tableData,
+        status: "Available" 
+      };
+    } catch (error) {
+      console.error("Error adding table:", error);
+      throw error;
+    }
+  },
 
+  // Remove a table from the database
+  removeTable: async (tableId) => {
+    try {
+      const tableRef = doc(db, "tables", tableId);
+      await deleteDoc(tableRef);
+      return true;
+    } catch (error) {
+      console.error("Error removing table:", error);
+      throw error;
+    }
+  },
+  
   // Customers collection
   joinQueue: async (customerData) => {
     try {
+      // Fixed initial wait time for all customers
+      const INITIAL_WAIT_TIME = 7; // 7 minutes initial wait
+      
+      // Create customer in database with server timestamps
       const docRef = await addDoc(collection(db, "customers"), {
         ...customerData,
         timestamp: serverTimestamp(),
         status: "Waiting",
-        tableNumber: null
+        tableNumber: null,
+        waitTime: INITIAL_WAIT_TIME,
+        waitTimeInitial: INITIAL_WAIT_TIME,
+        waitTimeUpdatedAt: serverTimestamp(),
+        lastUpdateTime: serverTimestamp()
       });
-      return { id: docRef.id, ...customerData };
+      
+      // Return complete customer object
+      return { 
+        id: docRef.id, 
+        ...customerData,
+        waitTime: INITIAL_WAIT_TIME,
+        waitTimeInitial: INITIAL_WAIT_TIME,
+        status: "Waiting"
+      };
     } catch (error) {
       console.error("Error joining queue:", error);
       throw error;
@@ -152,17 +203,51 @@ const FirebaseService = {
     }, (error) => {
       console.error("Error in tables listener:", error);
     });
-  },
-
-  onQueueChange: (callback) => {
+  },  onQueueChange: (callback) => {
     const queueRef = collection(db, "customers");
     const q = query(queueRef, orderBy("timestamp", "asc"));
     return onSnapshot(q, (snapshot) => {
-      const queue = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data(),
-        timestamp: doc.data().timestamp?.toDate?.() || new Date()
-      }));
+      const queue = snapshot.docs.map(doc => {
+        const data = doc.data();
+        
+        // Get basic timestamp
+        const timestamp = data.timestamp?.toDate?.() || new Date();
+        
+        // Calculate accurate wait time based on server timestamp
+        let waitTime = data.waitTime || 7; // Default to 7 if not set
+        let shouldReset = false;
+        
+        // If we have a waitTimeUpdatedAt timestamp, calculate the elapsed time
+        if (data.waitTimeUpdatedAt && data.waitTimeUpdatedAt.toDate) {
+          const updatedAt = data.waitTimeUpdatedAt.toDate();
+          const now = new Date();
+          
+          // Calculate minutes elapsed since last update (using precise millisecond calculation)
+          const elapsedMinutes = (now - updatedAt) / (1000 * 60);
+          
+          // Subtract elapsed time from stored wait time
+          waitTime = Math.max(0, waitTime - elapsedMinutes);
+          
+          // Flag if timer should be reset (using consistent threshold of 0.05 minutes = 3 seconds)
+          shouldReset = (waitTime <= 0.05);
+          
+          // If timer reached zero, reset to 3 minutes
+          // Only reset if it was recently at zero (within last 30 seconds)
+          if (shouldReset && elapsedMinutes <= 0.5) {
+            waitTime = 3;
+          }
+        }
+          // Return customer with calculated wait time
+        return {
+          id: doc.id,
+          ...data,
+          timestamp,
+          calculatedWaitTime: waitTime, // Add calculated time as separate property
+          waitTime: data.waitTime || 7, // Keep original stored time
+          shouldResetTimer: shouldReset, // Add reset flag for consistent behavior
+          lastUpdateTime: data.lastUpdateTime?.toDate?.() || timestamp
+        };
+      });
       callback(queue);
     }, (error) => {
       console.error("Error in queue listener:", error);
@@ -232,7 +317,127 @@ const FirebaseService = {
       console.error("Error in table assignment transaction:", error);
       throw error;
     }
-  }
+  },
+  // Centralized timer management
+  updateCustomerWaitTime: async (customerId, newWaitTime) => {
+    try {
+      // Validate wait time value
+      let validWaitTime = newWaitTime;
+      
+      // Ensure it's a number and in valid range
+      if (typeof validWaitTime !== 'number' || isNaN(validWaitTime)) {
+        validWaitTime = 7; // Default to 7 if invalid
+      }
+      
+      // Reset to exactly 3 minutes if timer reached zero or is very close to zero
+      if (validWaitTime <= 0.05) {
+        validWaitTime = 3;
+        console.log(`Timer for customer ${customerId} has been reset to 3 minutes`);
+      }
+      
+      // Clamp between 0 and 7 minutes to prevent invalid values
+      validWaitTime = Math.min(7, Math.max(0, validWaitTime));
+      
+      const customerRef = doc(db, "customers", customerId);
+      
+      // Add flag for reset if this was a reset operation
+      const updateData = {
+        waitTime: validWaitTime,
+        waitTimeUpdatedAt: serverTimestamp(),
+        lastWaitTimeUpdate: new Date().toISOString(),
+        // Add the timer reset flag for better cross-client synchronization
+        timerReset: validWaitTime === 3 && newWaitTime <= 0.05
+      };
+      
+      await updateDoc(customerRef, updateData);
+      
+      return validWaitTime;
+    } catch (error) {
+      console.error("Error updating customer wait time:", error);
+      throw error;
+    }
+  },
+  
+  // Get precise server time
+  getServerTime: async () => {
+    try {
+      // Create a temporary document with server timestamp
+      const docRef = await addDoc(collection(db, "_timeSync"), {
+        timestamp: serverTimestamp()
+      });
+      
+      // Read the document to get the server time
+      const docSnap = await getDocs(doc(db, "_timeSync", docRef.id));
+      const serverTime = docSnap.data().timestamp.toDate();
+      
+      // Clean up the temporary document
+      await deleteDoc(docRef);
+      
+      return serverTime;
+    } catch (error) {
+      console.error("Error getting server time:", error);
+      // Return local time as fallback
+      return new Date();
+    }
+  },    onSingleCustomerChange: (customerId, callback) => {
+    const customerRef = doc(db, "customers", customerId);
+    return onSnapshot(customerRef, (doc) => {
+      if (doc.exists()) {
+        const data = doc.data();
+        
+        // Get basic timestamp
+        const timestamp = data.timestamp?.toDate?.() || new Date();
+        
+        // Calculate accurate wait time based on server timestamp
+        let waitTime = data.waitTime || 7; // Default to 7 if not set
+        let shouldReset = false;
+        
+        // Check for explicit timer reset flag from database updates
+        if (data.timerReset === true) {
+          // Timer was explicitly reset by another client
+          shouldReset = true;
+          waitTime = 3; // Use the reset value directly
+          console.log(`Timer reset detected for customer ${customerId} from database flag`);
+        }
+        // Otherwise calculate based on elapsed time
+        else if (data.waitTimeUpdatedAt && data.waitTimeUpdatedAt.toDate) {
+          const updatedAt = data.waitTimeUpdatedAt.toDate();
+          const now = new Date();
+          
+          // Calculate minutes elapsed since last update with precise milliseconds
+          const elapsedMinutes = (now - updatedAt) / (1000 * 60);
+          
+          // Subtract elapsed time from stored wait time
+          waitTime = Math.max(0, waitTime - elapsedMinutes);
+          
+          // Detect if timer should be reset using consistent threshold (0.05)
+          shouldReset = (waitTime <= 0.05);
+          
+          // If timer reached zero, reset to 3 minutes
+          // Only reset if it was recently at zero (within last 30 seconds)
+          if (shouldReset && elapsedMinutes <= 0.5) {
+            waitTime = 3;
+            console.log(`Timer automatically reset for customer ${customerId} based on elapsed time`);
+          }
+        }
+          // Return customer with calculated wait time and synchronized reset information
+        callback({
+          id: doc.id,
+          ...data,
+          timestamp,
+          calculatedWaitTime: waitTime, // Add calculated time as separate property
+          waitTime: data.waitTime || 7, // Keep original stored time
+          shouldResetTimer: shouldReset || data.timerReset === true, // Reset flag based on calculation or explicit flag
+          timerWasReset: data.timerReset === true, // Flag indicating if timer was explicitly reset
+          lastUpdateTime: data.lastUpdateTime?.toDate?.() || timestamp
+        });
+      } else {
+        callback(null);
+      }
+    }, (error) => {
+      console.error(`Error in customer ${customerId} listener:`, error);
+    });
+  },
 };
 
-export default FirebaseService; 
+export default FirebaseService;
